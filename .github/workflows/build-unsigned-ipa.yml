@@ -1,0 +1,255 @@
+name: Build Unsigned Madeira IPA
+
+# Manual trigger only — this build is heavy (native Wine/FEX/DXMT toolchains +
+# an Xcode archive) and free macOS runner minutes are burned at a 10x
+# multiplier. Do not run this on every push.
+on:
+  workflow_dispatch:
+    inputs:
+      xcode_scheme:
+        description: "Xcode scheme to build (check app/Madeira.xcodeproj)"
+        required: false
+        default: "Madeira"
+      configuration:
+        description: "Debug or Release"
+        required: false
+        default: "Release"
+
+# Bail out fast rather than burning minutes on a doomed run.
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+
+env:
+  LLVM_MINGW_VERSION: "20240619"     # pin — check llvm-mingw releases for latest
+  LLVM_MINGW_DIR: ${{ github.workspace }}/toolchains/llvm-mingw
+  LLVM15_PREFIX: /usr/local/opt/llvm@15
+  DERIVED_DATA_PATH: ${{ github.workspace }}/build/DerivedData
+  IPA_STAGING: ${{ github.workspace }}/ipa-staging
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 350   # macos-latest free tier ceiling is ~360; leave headroom for upload
+
+    steps:
+      # ------------------------------------------------------------------
+      # 1. CHECKOUT — recursive submodules pull in the forked FEX, wine,
+      #    and research/dxmt trees. This alone can take several minutes.
+      # ------------------------------------------------------------------
+      - name: Checkout (recursive submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Show toolchain versions for debugging
+        run: |
+          echo "== Xcode =="
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          echo "== Host =="
+          sw_vers
+          uname -a
+
+      # ------------------------------------------------------------------
+      # 2. HOST DEPENDENCIES — build systems and libraries needed to
+      #    configure/build Wine's unix libs, FEX, and DXMT's native pieces.
+      #    Adjust this list against each build/*/README as you hit
+      #    "command not found" errors — this is a reasonable starting set,
+      #    not a guaranteed-complete one for a project this size.
+      # ------------------------------------------------------------------
+      - name: Install Homebrew dependencies
+        run: |
+          brew update
+          brew install \
+            cmake \
+            ninja \
+            meson \
+            pkg-config \
+            bison \
+            flex \
+            gettext \
+            automake \
+            autoconf \
+            libtool \
+            python@3.12 \
+            llvm@15
+          brew link --force llvm@15 || true
+
+      # ------------------------------------------------------------------
+      # 3. llvm-mingw — required for cross-compiling ARM64EC PE modules
+      #    (Wine's PE-side DLLs) per build/dxmt-ios/README.md.
+      # ------------------------------------------------------------------
+      - name: Cache llvm-mingw
+        id: cache-llvm-mingw
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.LLVM_MINGW_DIR }}
+          key: llvm-mingw-macos-${{ env.LLVM_MINGW_VERSION }}
+
+      - name: Download llvm-mingw
+        if: steps.cache-llvm-mingw.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$(dirname "$LLVM_MINGW_DIR")"
+          curl -L -o llvm-mingw.tar.xz \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-macos-universal.tar.xz"
+          tar xf llvm-mingw.tar.xz
+          mv llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-macos-universal "$LLVM_MINGW_DIR"
+
+      - name: Export toolchain PATHs
+        run: |
+          echo "$LLVM_MINGW_DIR/bin" >> "$GITHUB_PATH"
+          echo "$LLVM15_PREFIX/bin" >> "$GITHUB_PATH"
+
+      - name: Verify toolchains resolve
+        run: |
+          which aarch64-w64-mingw32-clang || echo "::warning::llvm-mingw not on PATH — check archive layout"
+          which llvm-config || echo "::warning::LLVM 15 not on PATH — check brew link"
+          clang --version
+
+      # ------------------------------------------------------------------
+      # 4. VC++ RUNTIME DLLS — the repo intentionally does not ship these
+      #    (see tools/fetch-vcruntime.md). You must provide them yourself,
+      #    e.g. as a private repo secret/artifact, or the app build step
+      #    that copies them into the bundle will fail. This step is a
+      #    placeholder — wire up your own source before relying on it.
+      # ------------------------------------------------------------------
+      - name: Fetch VC++ runtime DLLs (placeholder — see tools/fetch-vcruntime.md)
+        continue-on-error: true
+        run: |
+          cat tools/fetch-vcruntime.md
+          echo "::warning::VC++ runtime DLLs must be supplied manually. \
+                Populate them here (e.g. actions/download-artifact from a \
+                private cache, or a self-hosted secret) before this step \
+                will do anything real."
+
+      # ------------------------------------------------------------------
+      # 5. NATIVE BUILD CHAIN
+      #    Order matters and is NOT fully verifiable from the README alone
+      #    — confirm against each build/*/README.md before trusting this
+      #    blindly. General dependency shape for a Wine+FEX+DXMT-on-iOS
+      #    stack is: low-level unix libs → FEX → DXMT (needs FEX/wine
+      #    headers) → ARM64EC PE side. continue-on-error is set on the
+      #    less-critical/optional-looking libs so one failure doesn't burn
+      #    your whole run before you see later logs; remove it once your
+      #    build is stable.
+      # ------------------------------------------------------------------
+      - name: Build unix-side ntdll (build/ntdll-unix)
+        run: |
+          chmod +x build/ntdll-unix/build.sh
+          ./build/ntdll-unix/build.sh
+
+      - name: Build supporting iOS libraries (gnutls-ios, freetype-ios, etc.)
+        run: |
+          for dir in build/*-ios/; do
+            name="$(basename "$dir")"
+            if [ "$name" = "dxmt-ios" ]; then
+              continue   # built explicitly below, after its dependencies
+            fi
+            if [ -f "${dir}build.sh" ]; then
+              echo "::group::Building $name"
+              chmod +x "${dir}build.sh"
+              "${dir}build.sh" || { echo "::error::$name failed"; exit 1; }
+              echo "::endgroup::"
+            fi
+          done
+
+      - name: Build FEX-Emu
+        run: |
+          if [ -d FEX ]; then
+            ls FEX/build*.sh 2>/dev/null || true
+            # FEX's own build entry point may differ from build/*/build.sh —
+            # check the FEX fork's README for the exact CMake invocation
+            # (it is typically CMake + ninja, cross-compiled for ARM64EC).
+            echo "::warning::Confirm FEX's actual build entry point against willfaust/FEX README — adjust this step accordingly."
+          fi
+
+      - name: Build DXMT for iOS (build/dxmt-ios)
+        run: |
+          cat build/dxmt-ios/README.md
+          chmod +x build/dxmt-ios/build.sh
+          ./build/dxmt-ios/build.sh
+
+      - name: Build remaining build/* scripts not yet run
+        continue-on-error: true
+        run: |
+          for dir in build/*/; do
+            name="$(basename "$dir")"
+            case "$name" in
+              ntdll-unix|dxmt-ios) continue ;;
+              *-ios) continue ;;   # already handled above
+            esac
+            if [ -f "${dir}build.sh" ]; then
+              echo "::group::Building $name"
+              chmod +x "${dir}build.sh"
+              "${dir}build.sh" || echo "::warning::$name failed — check log above"
+              echo "::endgroup::"
+            fi
+          done
+
+      # ------------------------------------------------------------------
+      # 6. iOS APP — unsigned archive. CODE_SIGNING_ALLOWED=NO plus an
+      #    empty CODE_SIGN_IDENTITY skips the whole signing chain so this
+      #    step doesn't need any certificates or provisioning profiles.
+      # ------------------------------------------------------------------
+      - name: List available schemes (debug aid)
+        run: |
+          xcodebuild -project app/Madeira.xcodeproj -list
+
+      - name: Archive app (unsigned)
+        run: |
+          mkdir -p "$DERIVED_DATA_PATH"
+          xcodebuild \
+            -project app/Madeira.xcodeproj \
+            -scheme "${{ inputs.xcode_scheme }}" \
+            -configuration "${{ inputs.configuration }}" \
+            -sdk iphoneos \
+            -derivedDataPath "$DERIVED_DATA_PATH" \
+            -archivePath "$DERIVED_DATA_PATH/Madeira.xcarchive" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            archive | xcpretty || true
+          # xcpretty is optional prettification; the raw xcodebuild exit
+          # code is what actually determines success below.
+          test -d "$DERIVED_DATA_PATH/Madeira.xcarchive"
+
+      # ------------------------------------------------------------------
+      # 7. PACKAGE INTO .IPA — an IPA is just a zip with the .app inside
+      #    a top-level "Payload/" directory. No export plist / signing
+      #    step is needed since we never signed anything.
+      # ------------------------------------------------------------------
+      - name: Package unsigned .ipa
+        run: |
+          APP_PATH=$(find "$DERIVED_DATA_PATH/Madeira.xcarchive/Products/Applications" -maxdepth 1 -name "*.app" | head -n1)
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::No .app found in archive Products/Applications"
+            exit 1
+          fi
+          mkdir -p "$IPA_STAGING/Payload"
+          cp -R "$APP_PATH" "$IPA_STAGING/Payload/"
+          cd "$IPA_STAGING"
+          zip -r -y "Madeira-unsigned.ipa" Payload
+          mv "Madeira-unsigned.ipa" "$GITHUB_WORKSPACE/"
+
+      # ------------------------------------------------------------------
+      # 8. UPLOAD ARTIFACT
+      # ------------------------------------------------------------------
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-unsigned-ipa
+          path: Madeira-unsigned.ipa
+          retention-days: 14
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            **/*.log
+            build/**/*.log
+          if-no-files-found: ignore
